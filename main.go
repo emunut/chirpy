@@ -1,7 +1,9 @@
 package main
 
 import (
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -15,8 +17,7 @@ import (
 	"chirpy/internal/database"
 
 	"github.com/google/uuid"
-	"github.com/joho/godotenv"
-	_ "github.com/lib/pq"
+	_ "github.com/jackc/pgx/v5/stdlib"
 )
 
 type apiConfig struct {
@@ -26,34 +27,24 @@ type apiConfig struct {
 	jwtSecret      string
 }
 
-type errorResponse struct {
-	Error string `json:"error"`
+type UserResponse struct {
+	ID           uuid.UUID `json:"id"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
+	Email        string    `json:"email"`
+	Token        string    `json:"token,omitempty"`
+	RefreshToken string    `json:"refresh_token,omitempty"`
 }
 
-func respondWithError(w http.ResponseWriter, code int, msg string) {
-	respondWithJSON(w, code, errorResponse{
-		Error: msg,
-	})
-}
-
-func respondWithJSON(w http.ResponseWriter, code int, payload any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(code)
-
-	if payload != nil {
-		data, err := json.Marshal(payload)
-		if err != nil {
-			log.Printf("error marshaling JSON: %v", err)
-			return
-		}
-
-		w.Write(data)
-	}
+type ChirpResponse struct {
+	ID        uuid.UUID `json:"id"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+	Body      string    `json:"body"`
+	UserID    uuid.UUID `json:"user_id"`
 }
 
 func main() {
-	godotenv.Load()
-
 	dbURL := os.Getenv("DB_URL")
 	if dbURL == "" {
 		log.Fatal("DB_URL must be set")
@@ -69,15 +60,14 @@ func main() {
 		log.Fatal("JWT_SECRET must be set")
 	}
 
-	db, err := sql.Open("postgres", dbURL)
+	dbConn, err := sql.Open("pgx", dbURL)
 	if err != nil {
 		log.Fatal(err)
 	}
-
-	dbQueries := database.New(db)
+	defer dbConn.Close()
 
 	apiCfg := apiConfig{
-		db:        dbQueries,
+		db:        database.New(dbConn),
 		platform:  platform,
 		jwtSecret: jwtSecret,
 	}
@@ -85,20 +75,19 @@ func main() {
 	mux := http.NewServeMux()
 
 	fileServer := http.FileServer(http.Dir("."))
+	appHandler := http.StripPrefix("/app", fileServer)
 
-	mux.Handle(
-		"/app/",
-		apiCfg.middlewareMetricsInc(
-			http.StripPrefix("/app", fileServer),
-		),
-	)
+	mux.Handle("/app/", apiCfg.middlewareMetricsInc(appHandler))
 
 	mux.HandleFunc("GET /healthz", handlerReadiness)
+
 	mux.HandleFunc("GET /admin/metrics", apiCfg.handlerMetrics)
 	mux.HandleFunc("POST /admin/reset", apiCfg.handlerReset)
 
 	mux.HandleFunc("POST /api/users", apiCfg.handlerCreateUser)
 	mux.HandleFunc("POST /api/login", apiCfg.handlerLogin)
+	mux.HandleFunc("POST /api/refresh", apiCfg.handlerRefresh)
+	mux.HandleFunc("POST /api/revoke", apiCfg.handlerRevoke)
 
 	mux.HandleFunc("POST /api/chirps", apiCfg.handlerCreateChirp)
 	mux.HandleFunc("GET /api/chirps", apiCfg.handlerGetChirps)
@@ -109,7 +98,7 @@ func main() {
 		Handler: mux,
 	}
 
-	log.Println("Server starting on :8080")
+	log.Println("Serving on port 8080")
 	log.Fatal(server.ListenAndServe())
 }
 
@@ -127,24 +116,22 @@ func handlerReadiness(w http.ResponseWriter, r *http.Request) {
 }
 
 func (cfg *apiConfig) handlerMetrics(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/html")
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.WriteHeader(http.StatusOK)
 
-	html := fmt.Sprintf(`
-<html>
+	html := fmt.Sprintf(`<html>
   <body>
     <h1>Welcome, Chirpy Admin</h1>
     <p>Chirpy has been visited %d times!</p>
   </body>
-</html>
-`, cfg.fileserverHits.Load())
+</html>`, cfg.fileserverHits.Load())
 
-	w.WriteHeader(http.StatusOK)
 	w.Write([]byte(html))
 }
 
 func (cfg *apiConfig) handlerReset(w http.ResponseWriter, r *http.Request) {
 	if cfg.platform != "dev" {
-		respondWithError(w, http.StatusForbidden, "Forbidden")
+		respondWithError(w, http.StatusForbidden, "forbidden")
 		return
 	}
 
@@ -161,26 +148,16 @@ func (cfg *apiConfig) handlerReset(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte("OK"))
 }
 
-type createUserParams struct {
-	Email    string `json:"email"`
-	Password string `json:"password"`
-}
-
-type userResponse struct {
-	ID        uuid.UUID `json:"id"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
-	Email     string    `json:"email"`
-	Token     string    `json:"token,omitempty"`
-}
-
 func (cfg *apiConfig) handlerCreateUser(w http.ResponseWriter, r *http.Request) {
-	params := createUserParams{}
+	type parameters struct {
+		Email    string `json:"email"`
+		Password string `json:"password"`
+	}
 
-	decoder := json.NewDecoder(r.Body)
-	err := decoder.Decode(&params)
+	params := parameters{}
+	err := json.NewDecoder(r.Body).Decode(&params)
 	if err != nil {
-		respondWithError(w, http.StatusBadRequest, "invalid request body")
+		respondWithError(w, http.StatusBadRequest, "invalid request")
 		return
 	}
 
@@ -199,7 +176,7 @@ func (cfg *apiConfig) handlerCreateUser(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	respondWithJSON(w, http.StatusCreated, userResponse{
+	respondWithJSON(w, http.StatusCreated, UserResponse{
 		ID:        user.ID,
 		CreatedAt: user.CreatedAt,
 		UpdatedAt: user.UpdatedAt,
@@ -207,19 +184,16 @@ func (cfg *apiConfig) handlerCreateUser(w http.ResponseWriter, r *http.Request) 
 	})
 }
 
-type loginParams struct {
-	Email            string `json:"email"`
-	Password         string `json:"password"`
-	ExpiresInSeconds int    `json:"expires_in_seconds"`
-}
-
 func (cfg *apiConfig) handlerLogin(w http.ResponseWriter, r *http.Request) {
-	params := loginParams{}
+	type parameters struct {
+		Email    string `json:"email"`
+		Password string `json:"password"`
+	}
 
-	decoder := json.NewDecoder(r.Body)
-	err := decoder.Decode(&params)
+	params := parameters{}
+	err := json.NewDecoder(r.Body).Decode(&params)
 	if err != nil {
-		respondWithError(w, http.StatusBadRequest, "invalid request body")
+		respondWithError(w, http.StatusBadRequest, "invalid request")
 		return
 	}
 
@@ -229,84 +203,115 @@ func (cfg *apiConfig) handlerLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	passwordMatches, err := auth.CheckPasswordHash(
-		params.Password,
-		user.HashedPassword,
-	)
-
+	passwordMatches, err := auth.CheckPasswordHash(params.Password, user.HashedPassword)
 	if err != nil || !passwordMatches {
 		respondWithError(w, http.StatusUnauthorized, "incorrect email or password")
 		return
 	}
 
-	expiresIn := time.Hour
-
-	if params.ExpiresInSeconds > 0 {
-		requestedExpiration := time.Duration(params.ExpiresInSeconds) * time.Second
-
-		if requestedExpiration < time.Hour {
-			expiresIn = requestedExpiration
-		}
-	}
-
-	token, err := auth.MakeJWT(user.ID, cfg.jwtSecret, expiresIn)
+	accessToken, err := auth.MakeJWT(user.ID, cfg.jwtSecret, time.Hour)
 	if err != nil {
-		respondWithError(w, http.StatusInternalServerError, "couldn't create token")
+		respondWithError(w, http.StatusInternalServerError, "couldn't create access token")
 		return
 	}
 
-	respondWithJSON(w, http.StatusOK, userResponse{
-		ID:        user.ID,
-		CreatedAt: user.CreatedAt,
-		UpdatedAt: user.UpdatedAt,
-		Email:     user.Email,
-		Token:     token,
+	refreshToken, err := makeRefreshToken()
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "couldn't create refresh token")
+		return
+	}
+
+	_, err = cfg.db.CreateRefreshToken(r.Context(), database.CreateRefreshTokenParams{
+		Token:     refreshToken,
+		UserID:    user.ID,
+		ExpiresAt: time.Now().Add(60 * 24 * time.Hour),
+	})
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "couldn't save refresh token")
+		return
+	}
+
+	respondWithJSON(w, http.StatusOK, UserResponse{
+		ID:           user.ID,
+		CreatedAt:    user.CreatedAt,
+		UpdatedAt:    user.UpdatedAt,
+		Email:        user.Email,
+		Token:        accessToken,
+		RefreshToken: refreshToken,
 	})
 }
 
-type chirpParams struct {
-	Body string `json:"body"`
-}
-
-type chirpResponse struct {
-	ID        uuid.UUID `json:"id"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
-	Body      string    `json:"body"`
-	UserID    uuid.UUID `json:"user_id"`
-}
-
-func (cfg *apiConfig) handlerCreateChirp(w http.ResponseWriter, r *http.Request) {
-	tokenString, err := auth.GetBearerToken(r.Header)
+func (cfg *apiConfig) handlerRefresh(w http.ResponseWriter, r *http.Request) {
+	refreshToken, err := auth.GetBearerToken(r.Header)
 	if err != nil {
-		respondWithError(w, http.StatusUnauthorized, "missing or invalid token")
+		respondWithError(w, http.StatusUnauthorized, "missing refresh token")
 		return
 	}
 
-	userID, err := auth.ValidateJWT(tokenString, cfg.jwtSecret)
+	user, err := cfg.db.GetUserFromRefreshToken(r.Context(), refreshToken)
+	if err != nil {
+		respondWithError(w, http.StatusUnauthorized, "invalid refresh token")
+		return
+	}
+
+	accessToken, err := auth.MakeJWT(user.ID, cfg.jwtSecret, time.Hour)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "couldn't create access token")
+		return
+	}
+
+	respondWithJSON(w, http.StatusOK, map[string]string{
+		"token": accessToken,
+	})
+}
+
+func (cfg *apiConfig) handlerRevoke(w http.ResponseWriter, r *http.Request) {
+	refreshToken, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		respondWithError(w, http.StatusUnauthorized, "missing refresh token")
+		return
+	}
+
+	err = cfg.db.RevokeRefreshToken(r.Context(), refreshToken)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "couldn't revoke refresh token")
+		return
+	}
+
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (cfg *apiConfig) handlerCreateChirp(w http.ResponseWriter, r *http.Request) {
+	type parameters struct {
+		Body string `json:"body"`
+	}
+
+	token, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		respondWithError(w, http.StatusUnauthorized, "missing token")
+		return
+	}
+
+	userID, err := auth.ValidateJWT(token, cfg.jwtSecret)
 	if err != nil {
 		respondWithError(w, http.StatusUnauthorized, "invalid token")
 		return
 	}
 
-	params := chirpParams{}
-
-	decoder := json.NewDecoder(r.Body)
-	err = decoder.Decode(&params)
+	params := parameters{}
+	err = json.NewDecoder(r.Body).Decode(&params)
 	if err != nil {
-		respondWithError(w, http.StatusBadRequest, "invalid request body")
+		respondWithError(w, http.StatusBadRequest, "invalid request")
 		return
 	}
 
 	if len(params.Body) > 140 {
-		respondWithError(w, http.StatusBadRequest, "Chirp is too long")
+		respondWithError(w, http.StatusBadRequest, "chirp is too long")
 		return
 	}
 
-	cleanedBody := cleanChirp(params.Body)
-
 	chirp, err := cfg.db.CreateChirp(r.Context(), database.CreateChirpParams{
-		Body:   cleanedBody,
+		Body:   cleanBody(params.Body),
 		UserID: userID,
 	})
 	if err != nil {
@@ -314,7 +319,7 @@ func (cfg *apiConfig) handlerCreateChirp(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	respondWithJSON(w, http.StatusCreated, chirpResponse{
+	respondWithJSON(w, http.StatusCreated, ChirpResponse{
 		ID:        chirp.ID,
 		CreatedAt: chirp.CreatedAt,
 		UpdatedAt: chirp.UpdatedAt,
@@ -330,10 +335,9 @@ func (cfg *apiConfig) handlerGetChirps(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	response := []chirpResponse{}
-
+	response := []ChirpResponse{}
 	for _, chirp := range chirps {
-		response = append(response, chirpResponse{
+		response = append(response, ChirpResponse{
 			ID:        chirp.ID,
 			CreatedAt: chirp.CreatedAt,
 			UpdatedAt: chirp.UpdatedAt,
@@ -350,7 +354,7 @@ func (cfg *apiConfig) handlerGetChirp(w http.ResponseWriter, r *http.Request) {
 
 	chirpID, err := uuid.Parse(chirpIDString)
 	if err != nil {
-		respondWithError(w, http.StatusBadRequest, "invalid chirp ID")
+		respondWithError(w, http.StatusBadRequest, "invalid chirp id")
 		return
 	}
 
@@ -360,7 +364,7 @@ func (cfg *apiConfig) handlerGetChirp(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	respondWithJSON(w, http.StatusOK, chirpResponse{
+	respondWithJSON(w, http.StatusOK, ChirpResponse{
 		ID:        chirp.ID,
 		CreatedAt: chirp.CreatedAt,
 		UpdatedAt: chirp.UpdatedAt,
@@ -369,7 +373,18 @@ func (cfg *apiConfig) handlerGetChirp(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func cleanChirp(body string) string {
+func makeRefreshToken() (string, error) {
+	randomBytes := make([]byte, 32)
+
+	_, err := rand.Read(randomBytes)
+	if err != nil {
+		return "", err
+	}
+
+	return hex.EncodeToString(randomBytes), nil
+}
+
+func cleanBody(body string) string {
 	badWords := map[string]bool{
 		"kerfuffle": true,
 		"sharbert":  true,
@@ -377,14 +392,30 @@ func cleanChirp(body string) string {
 	}
 
 	words := strings.Split(body, " ")
-
 	for i, word := range words {
-		loweredWord := strings.ToLower(word)
-
-		if badWords[loweredWord] {
+		if badWords[strings.ToLower(word)] {
 			words[i] = "****"
 		}
 	}
 
 	return strings.Join(words, " ")
+}
+
+func respondWithError(w http.ResponseWriter, code int, msg string) {
+	respondWithJSON(w, code, map[string]string{
+		"error": msg,
+	})
+}
+
+func respondWithJSON(w http.ResponseWriter, code int, payload any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(code)
+
+	data, err := json.Marshal(payload)
+	if err != nil {
+		log.Printf("error marshaling JSON: %s", err)
+		return
+	}
+
+	w.Write(data)
 }
